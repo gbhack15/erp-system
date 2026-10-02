@@ -9,6 +9,11 @@ document.addEventListener("DOMContentLoaded", () => {
     initClock();
     initEmployeeOptions();
     loadAttendanceLogs();
+
+    // 5초마다 조용히 백그라운드 자동 갱신 (다른 PC/대시보드 변동사항 실시간 동기화)
+    setInterval(() => {
+        loadAttendanceLogs(true);
+    }, 5000);
 });
 
 // Live clock
@@ -28,15 +33,32 @@ function initClock() {
     setInterval(update, 1000);
 }
 
+function getTodayDateString() {
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+}
+
+function getCurrentTimeString() {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mi = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+    return `${hh}:${mi}:${ss}`;
+}
+
 // Fetch employee list for select dropdown
 async function initEmployeeOptions() {
     try {
-        const res = await fetch("/api/employees");
+        const res = await fetch(`/api/employees?_t=${Date.now()}`, { cache: "no-store" });
         const json = await res.json();
         if (json.success && json.employees) {
             allEmployeesList = json.employees;
             const selectEl = document.getElementById("empSelect");
             if (selectEl) {
+                const curVal = selectEl.value;
                 selectEl.innerHTML = `<option value="">[전체] 등록된 사원 전체 보기</option>`;
                 allEmployeesList.forEach(emp => {
                     const opt = document.createElement("option");
@@ -45,6 +67,7 @@ async function initEmployeeOptions() {
                     opt.textContent = `[${emp.dept_name}] ${emp.emp_name}${pos} (${emp.emp_id})`;
                     selectEl.appendChild(opt);
                 });
+                if (curVal) selectEl.value = curVal;
             }
         }
     } catch (err) {
@@ -109,15 +132,17 @@ function updateUserDisplay(empName, deptName) {
 }
 
 // Fetch logs from backend
-async function loadAttendanceLogs() {
+async function loadAttendanceLogs(silent = false) {
     const tbody = document.getElementById("gridTbody");
-    tbody.innerHTML = `
-        <tr>
-            <td colspan="10" class="text-center" style="padding: 20px; color: #666;">
-                <i class="fa-solid fa-spinner fa-spin"></i> 데이터를 조회하는 중입니다...
-            </td>
-        </tr>
-    `;
+    if (!silent) {
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="10" class="text-center" style="padding: 20px; color: #666;">
+                    <i class="fa-solid fa-spinner fa-spin"></i> 데이터를 조회하는 중입니다...
+                </td>
+            </tr>
+        `;
+    }
 
     const startDate = document.getElementById("startDate").value;
     const endDate = document.getElementById("endDate").value;
@@ -127,21 +152,23 @@ async function loadAttendanceLogs() {
     if (startDate) params.append("start_date", startDate);
     if (endDate) params.append("end_date", endDate);
     if (empName) params.append("emp_name", empName);
+    params.append("_t", Date.now().toString());
 
     try {
-        const res = await fetch(`/api/attendance/logs?${params.toString()}`);
+        const res = await fetch(`/api/attendance/logs?${params.toString()}`, { cache: "no-store" });
         const json = await res.json();
 
         if (json.success) {
             attendanceData = json.data;
-            document.getElementById("recordCount").textContent = attendanceData.length;
+            const recEl = document.getElementById("recordCount");
+            if (recEl) recEl.textContent = attendanceData.length;
             renderGridTable();
         } else {
-            tbody.innerHTML = `<tr><td colspan="10" class="text-center" style="color: red; padding: 20px;">데이터 조회 오류가 발생했습니다.</td></tr>`;
+            if (!silent) tbody.innerHTML = `<tr><td colspan="10" class="text-center" style="color: red; padding: 20px;">데이터 조회 오류가 발생했습니다.</td></tr>`;
         }
     } catch (err) {
         console.error("API Error:", err);
-        tbody.innerHTML = `<tr><td colspan="10" class="text-center" style="color: red; padding: 20px;">서버 통신 장애: ${err.message}</td></tr>`;
+        if (!silent) tbody.innerHTML = `<tr><td colspan="10" class="text-center" style="color: red; padding: 20px;">서버 통신 장애: ${err.message}</td></tr>`;
     }
 }
 
@@ -222,12 +249,14 @@ async function handleCheckIn() {
         return;
     }
 
-    const now = new Date();
-    const workDate = (selectedRowIndex >= 0 && attendanceData[selectedRowIndex]) 
-        ? attendanceData[selectedRowIndex].work_date 
-        : `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const workDate = getTodayDateString();
+    const checkInTime = getCurrentTimeString();
 
-    const checkInTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+    // 조회 종료일자가 오늘보다 이전이면 오늘로 자동 확장하여 즉시 보이도록 처리
+    const endInput = document.getElementById("endDate");
+    if (endInput && endInput.value < workDate) {
+        endInput.value = workDate;
+    }
 
     try {
         const res = await fetch("/api/attendance/check-in", {
@@ -243,7 +272,7 @@ async function handleCheckIn() {
         const json = await res.json();
         if (json.success) {
             showErpAlert(json.message);
-            loadAttendanceLogs();
+            await loadAttendanceLogs();
         } else {
             showErpAlert("출근 처리 중 오류 발생");
         }
@@ -260,12 +289,14 @@ async function handleCheckOut() {
         return;
     }
 
-    const now = new Date();
-    const workDate = (selectedRowIndex >= 0 && attendanceData[selectedRowIndex]) 
-        ? attendanceData[selectedRowIndex].work_date 
-        : `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const workDate = getTodayDateString();
+    const checkOutTime = getCurrentTimeString();
 
-    const checkOutTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+    // 조회 종료일자가 오늘보다 이전이면 오늘로 자동 확장
+    const endInput = document.getElementById("endDate");
+    if (endInput && endInput.value < workDate) {
+        endInput.value = workDate;
+    }
 
     try {
         const res = await fetch("/api/attendance/check-out", {
@@ -281,7 +312,7 @@ async function handleCheckOut() {
         const json = await res.json();
         if (json.success) {
             showErpAlert(json.message);
-            loadAttendanceLogs();
+            await loadAttendanceLogs();
         } else {
             showErpAlert("퇴근 처리 중 오류 발생");
         }
@@ -289,7 +320,6 @@ async function handleCheckOut() {
         showErpAlert(`통신 오류: ${err.message}`);
     }
 }
-
 
 // Download Excel File
 function downloadExcel() {
@@ -301,6 +331,7 @@ function downloadExcel() {
     if (startDate) params.append("start_date", startDate);
     if (endDate) params.append("end_date", endDate);
     if (empName) params.append("emp_name", empName);
+    params.append("_t", Date.now().toString());
 
     window.location.href = `/api/attendance/export/excel?${params.toString()}`;
     showErpAlert("엑셀 파일 다운로드가 시작되었습니다.");

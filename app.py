@@ -147,7 +147,7 @@ def insert_attendance_tag(emp_id: str, emp_name: str, dept_name: str, tag_date: 
 def read_logs_df() -> pd.DataFrame:
     try:
         sb = get_supabase()
-        res = sb.table(ATTENDANCE_TABLE).select("*").execute()
+        res = sb.table(ATTENDANCE_TABLE).select("*").order("tag_date", desc=True).order("tag_time", desc=True).execute()
         raw_rows = res.data
         if not raw_rows:
             return pd.DataFrame(columns=["emp_id", "emp_name", "dept_name", "work_date", "check_in_time", "check_out_time", "anomaly_type", "status", "notified_at"])
@@ -173,7 +173,7 @@ def read_logs_df() -> pd.DataFrame:
             event_type = str(r.get("event_type", "")).upper()
             tag_time = str(r.get("tag_time", ""))
             if event_type == "CHECK_IN":
-                if not grouped[key]["check_in_time"] or tag_time < grouped[key]["check_in_time"]:
+                if not grouped[key]["check_in_time"] or tag_time > grouped[key]["check_in_time"]:
                     grouped[key]["check_in_time"] = tag_time
             elif event_type == "CHECK_OUT":
                 if not grouped[key]["check_out_time"] or tag_time > grouped[key]["check_out_time"]:
@@ -188,9 +188,9 @@ def read_logs_df() -> pd.DataFrame:
             elif out_t and out_t < "18:00:00":
                 g["anomaly_type"] = "조퇴"
             elif in_t and not out_t:
-                g["anomaly_type"] = "미퇴근"
+                g["anomaly_type"] = "지각" if in_t > "09:00:00" else "정상출근"
             elif not in_t and out_t:
-                g["anomaly_type"] = "미출근"
+                g["anomaly_type"] = "조퇴" if out_t < "18:00:00" else "정상퇴근"
             else:
                 g["anomaly_type"] = "정상근무"
             records.append(g)
@@ -232,11 +232,16 @@ def get_filtered_logs(
 
 @app.get("/api/attendance/logs")
 def get_attendance_logs(
+    response: Response,
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     emp_name: Optional[str] = Query(None),
     emp_id: Optional[str] = Query(None)
 ):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+
     s_date = start_date if isinstance(start_date, str) else None
     e_date = end_date if isinstance(end_date, str) else None
     e_name = emp_name if isinstance(emp_name, str) else None
@@ -314,7 +319,10 @@ def process_check_out(req: CheckOutRequest):
     }
 
 @app.get("/api/employees")
-def get_employees():
+def get_employees(response: Response):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     employees = get_all_employees()
     return {"success": True, "employees": employees}
 
