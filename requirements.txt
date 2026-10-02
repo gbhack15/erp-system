@@ -4,3 +4,5 @@ pandas
 openpyxl
 pydantic
 starlette
+supabase
+python-dotenv

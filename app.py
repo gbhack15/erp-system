@@ -10,6 +10,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 import pandas as pd
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+load_dotenv()
 
 app = FastAPI(
     title="GBSA ERP 근태리더기내역조회 API",
@@ -26,16 +30,22 @@ app.add_middleware(
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE_PATH = os.path.join(BASE_DIR, "erp_attendance_logs.csv")
-ALT_CSV_PATH = r"C:\Users\ahnsonglee\hackathon\erp_attendance_logs.csv"
 
-def get_csv_path() -> str:
-    if os.path.exists(CSV_FILE_PATH):
-        return CSV_FILE_PATH
-    elif os.path.exists(ALT_CSV_PATH):
-        return ALT_CSV_PATH
-    else:
-        raise HTTPException(status_code=500, detail="erp_attendance_logs.csv 파일이 존재하지 않습니다.")
+TABLE = "attendance_logs"
+COLUMNS = ["emp_id", "emp_name", "dept_name", "work_date", "check_in_time",
+           "check_out_time", "anomaly_type", "status", "notified_at"]
+
+_supabase: Optional[Client] = None
+
+def get_supabase() -> Client:
+    global _supabase
+    if _supabase is None:
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_KEY")
+        if not url or not key:
+            raise HTTPException(status_code=500, detail="SUPABASE_URL / SUPABASE_KEY 환경변수가 설정되지 않았습니다.")
+        _supabase = create_client(url, key)
+    return _supabase
 
 def generate_card_number(emp_id: str) -> str:
     """사번 기반 고정 13자리 카드번호 생성"""
@@ -54,17 +64,19 @@ class CheckOutRequest(BaseModel):
     check_out_time: Optional[str] = None
 
 def read_logs_df() -> pd.DataFrame:
-    path = get_csv_path()
-    try:
-        df = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
-    except Exception:
-        df = pd.read_csv(path, dtype=str, encoding="utf-8")
-    df = df.fillna("")
-    return df
+    sb = get_supabase()
+    rows, page, size = [], 0, 1000
+    while True:
+        res = sb.table(TABLE).select(",".join(COLUMNS)).range(page * size, (page + 1) * size - 1).execute()
+        rows.extend(res.data)
+        if len(res.data) < size:
+            break
+        page += 1
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    return df.fillna("").astype(str)
 
-def save_logs_df(df: pd.DataFrame):
-    path = get_csv_path()
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+def upsert_log(row: dict):
+    get_supabase().table(TABLE).upsert(row, on_conflict="emp_id,work_date").execute()
 
 def get_filtered_logs(
     start_date: Optional[str] = None,
@@ -148,6 +160,7 @@ def process_check_in(req: CheckInRequest):
         df.at[idx, "check_in_time"] = now_time
         if df.at[idx, "status"] == "미조치" or not df.at[idx, "status"]:
             df.at[idx, "status"] = "조치완료"
+        upsert_log(df.loc[idx, COLUMNS].to_dict())
         emp_name = str(df.at[idx, "emp_name"])
         dept_name = str(df.at[idx, "dept_name"])
     else:
@@ -170,12 +183,11 @@ def process_check_in(req: CheckInRequest):
             "status": "조치완료",
             "notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        df = pd.concat([pd.DataFrame([new_row]), df], ignore_index=True)
+        upsert_log(new_row)
 
-    save_logs_df(df)
     return {
         "success": True,
-        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 출근 처리가 완료되었습니다. (CSV 백데이터 저장 완료)",
+        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 출근 처리가 완료되었습니다. (Supabase 저장 완료)",
         "emp_id": emp_id,
         "emp_name": emp_name,
         "dept_name": dept_name,
@@ -196,6 +208,7 @@ def process_check_out(req: CheckOutRequest):
         idx = df[mask].index[0]
         df.at[idx, "check_out_time"] = now_time
         df.at[idx, "status"] = "조치완료"
+        upsert_log(df.loc[idx, COLUMNS].to_dict())
         emp_name = str(df.at[idx, "emp_name"])
         dept_name = str(df.at[idx, "dept_name"])
     else:
@@ -218,12 +231,11 @@ def process_check_out(req: CheckOutRequest):
             "status": "조치완료",
             "notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        df = pd.concat([pd.DataFrame([new_row]), df], ignore_index=True)
+        upsert_log(new_row)
 
-    save_logs_df(df)
     return {
         "success": True,
-        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 퇴근 처리가 완료되었습니다. (CSV 백데이터 저장 완료)",
+        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 퇴근 처리가 완료되었습니다. (Supabase 저장 완료)",
         "emp_id": emp_id,
         "emp_name": emp_name,
         "dept_name": dept_name,
