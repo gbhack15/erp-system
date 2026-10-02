@@ -37,11 +37,12 @@ async function initEmployeeOptions() {
             allEmployeesList = json.employees;
             const selectEl = document.getElementById("empSelect");
             if (selectEl) {
-                selectEl.innerHTML = `<option value="">[전체] 3개 부서 전체 보기</option>`;
+                selectEl.innerHTML = `<option value="">[전체] 등록된 사원 전체 보기</option>`;
                 allEmployeesList.forEach(emp => {
                     const opt = document.createElement("option");
                     opt.value = emp.emp_id;
-                    opt.textContent = `[${emp.dept_name}] ${emp.emp_name} (${emp.emp_id})`;
+                    const pos = emp.position ? ` ${emp.position}` : '';
+                    opt.textContent = `[${emp.dept_name}] ${emp.emp_name}${pos} (${emp.emp_id})`;
                     selectEl.appendChild(opt);
                 });
             }

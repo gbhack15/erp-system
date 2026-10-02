@@ -31,7 +31,17 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TABLE = "attendance"
+ATTENDANCE_TABLE = "attendance"
+EMPLOYEES_TABLE = "employees"
+
+DEFAULT_EMPLOYEES = [
+    {"emp_id": "GBSA2018012", "emp_name": "안송이", "dept_name": "AI산업팀", "position": "선임연구원"},
+    {"emp_id": "GBSA2019024", "emp_name": "김민준", "dept_name": "기획조정실", "position": "책임연구원"},
+    {"emp_id": "GBSA2020045", "emp_name": "이서연", "dept_name": "인사총무팀", "position": "선임연구원"},
+    {"emp_id": "GBSA2021077", "emp_name": "박도현", "dept_name": "AI산업팀", "position": "주임연구원"},
+    {"emp_id": "GBSA2022091", "emp_name": "최유진", "dept_name": "기획조정실", "position": "선임연구원"},
+    {"emp_id": "GBSA2023105", "emp_name": "정다은", "dept_name": "인사총무팀", "position": "주임연구원"}
+]
 
 _supabase: Optional[Client] = None
 
@@ -44,6 +54,52 @@ def get_supabase() -> Client:
             raise HTTPException(status_code=500, detail="SUPABASE_URL / SUPABASE_KEY 환경변수가 설정되지 않았습니다.")
         _supabase = create_client(url, key)
     return _supabase
+
+def get_all_employees() -> List[dict]:
+    """직원 전용 테이블(employees)에서 사원 목록을 조회 (없을 시 attendance 또는 기본 목록 fallback)"""
+    try:
+        sb = get_supabase()
+        res = sb.table(EMPLOYEES_TABLE).select("*").order("emp_id").execute()
+        if res.data and len(res.data) > 0:
+            return res.data
+    except Exception as e:
+        print(f"[Employees Table Read Notice] {e}")
+
+    # Fallback to unique employees from attendance table
+    try:
+        sb = get_supabase()
+        res = sb.table(ATTENDANCE_TABLE).select("emp_id, emp_name, dept_name").execute()
+        if res.data:
+            unique_map = {}
+            for r in res.data:
+                eid = str(r.get("emp_id", ""))
+                if eid and eid not in unique_map:
+                    unique_map[eid] = {
+                        "emp_id": eid,
+                        "emp_name": str(r.get("emp_name", "")),
+                        "dept_name": str(r.get("dept_name", "")),
+                        "position": "연구원"
+                    }
+            if unique_map:
+                return list(unique_map.values())
+    except Exception as e:
+        print(f"[Attendance Fallback Notice] {e}")
+
+    return DEFAULT_EMPLOYEES
+
+def get_employee_info(emp_id: str) -> dict:
+    """특정 사번의 직원 정보 조회"""
+    emp_id = str(emp_id).strip()
+    employees = get_all_employees()
+    for emp in employees:
+        if emp.get("emp_id") == emp_id:
+            return emp
+    return {
+        "emp_id": emp_id,
+        "emp_name": "안송이",
+        "dept_name": "AI산업팀",
+        "position": "선임연구원"
+    }
 
 def generate_card_number(emp_id: str) -> str:
     """사번 기반 고정 13자리 카드번호 생성"""
@@ -60,6 +116,14 @@ class CheckOutRequest(BaseModel):
     emp_id: str
     work_date: Optional[str] = None
     check_out_time: Optional[str] = None
+
+class EmployeeCreateRequest(BaseModel):
+    emp_id: str
+    emp_name: str
+    dept_name: str
+    position: Optional[str] = "선임연구원"
+    email: Optional[str] = ""
+    phone: Optional[str] = ""
 
 def insert_attendance_tag(emp_id: str, emp_name: str, dept_name: str, tag_date: str, tag_time: str, event_type: str):
     sb = get_supabase()
@@ -78,12 +142,12 @@ def insert_attendance_tag(emp_id: str, emp_name: str, dept_name: str, tag_date: 
         "raw_status": "SUCCESS",
         "ip_address": "127.0.0.1"
     }
-    sb.table(TABLE).insert(new_tag).execute()
+    sb.table(ATTENDANCE_TABLE).insert(new_tag).execute()
 
 def read_logs_df() -> pd.DataFrame:
     try:
         sb = get_supabase()
-        res = sb.table(TABLE).select("*").execute()
+        res = sb.table(ATTENDANCE_TABLE).select("*").execute()
         raw_rows = res.data
         if not raw_rows:
             return pd.DataFrame(columns=["emp_id", "emp_name", "dept_name", "work_date", "check_in_time", "check_out_time", "anomaly_type", "status", "notified_at"])
@@ -207,24 +271,19 @@ def get_attendance_logs(
 
 @app.post("/api/attendance/check-in")
 def process_check_in(req: CheckInRequest):
-    df = read_logs_df()
     today = req.work_date or datetime.now().strftime("%Y-%m-%d")
     now_time = req.check_in_time or datetime.now().strftime("%H:%M:%S")
 
-    emp_id = req.emp_id.strip()
-    emp_match = df[df["emp_id"] == emp_id]
-    if not emp_match.empty:
-        emp_name = str(emp_match.iloc[0]["emp_name"])
-        dept_name = str(emp_match.iloc[0]["dept_name"])
-    else:
-        emp_name = "안송이"
-        dept_name = "AI산업팀"
+    emp_info = get_employee_info(req.emp_id)
+    emp_id = emp_info["emp_id"]
+    emp_name = emp_info["emp_name"]
+    dept_name = emp_info["dept_name"]
 
     insert_attendance_tag(emp_id, emp_name, dept_name, today, now_time, "CHECK_IN")
 
     return {
         "success": True,
-        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 출근 처리가 완료되었습니다. (Supabase attendance 저장 완료)",
+        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 출근 로그가 등록되었습니다. (Supabase attendance 저장 완료)",
         "emp_id": emp_id,
         "emp_name": emp_name,
         "dept_name": dept_name,
@@ -234,30 +293,48 @@ def process_check_in(req: CheckInRequest):
 
 @app.post("/api/attendance/check-out")
 def process_check_out(req: CheckOutRequest):
-    df = read_logs_df()
     today = req.work_date or datetime.now().strftime("%Y-%m-%d")
     now_time = req.check_out_time or datetime.now().strftime("%H:%M:%S")
 
-    emp_id = req.emp_id.strip()
-    emp_match = df[df["emp_id"] == emp_id]
-    if not emp_match.empty:
-        emp_name = str(emp_match.iloc[0]["emp_name"])
-        dept_name = str(emp_match.iloc[0]["dept_name"])
-    else:
-        emp_name = "안송이"
-        dept_name = "AI산업팀"
+    emp_info = get_employee_info(req.emp_id)
+    emp_id = emp_info["emp_id"]
+    emp_name = emp_info["emp_name"]
+    dept_name = emp_info["dept_name"]
 
     insert_attendance_tag(emp_id, emp_name, dept_name, today, now_time, "CHECK_OUT")
 
     return {
         "success": True,
-        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 퇴근 처리가 완료되었습니다. (Supabase attendance 저장 완료)",
+        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 퇴근 로그가 등록되었습니다. (Supabase attendance 저장 완료)",
         "emp_id": emp_id,
         "emp_name": emp_name,
         "dept_name": dept_name,
         "work_date": today,
         "check_out_time": now_time
     }
+
+@app.get("/api/employees")
+def get_employees():
+    employees = get_all_employees()
+    return {"success": True, "employees": employees}
+
+@app.post("/api/employees")
+def create_employee(req: EmployeeCreateRequest):
+    try:
+        sb = get_supabase()
+        new_emp = {
+            "emp_id": req.emp_id.strip(),
+            "emp_name": req.emp_name.strip(),
+            "dept_name": req.dept_name.strip(),
+            "position": req.position or "선임연구원",
+            "email": req.email or "",
+            "phone": req.phone or "",
+            "status": "재직"
+        }
+        sb.table(EMPLOYEES_TABLE).insert(new_emp).execute()
+        return {"success": True, "message": f"{req.emp_name} 사원이 등록되었습니다.", "data": new_emp}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"사원 등록 실패: {str(e)}")
 
 @app.get("/api/attendance/export/csv")
 def export_csv(
@@ -322,11 +399,6 @@ def export_excel(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Excel generation error: {str(e)}")
 
-@app.get("/api/employees")
-def get_employees():
-    df = read_logs_df()
-    employees = df[["emp_id", "emp_name", "dept_name"]].drop_duplicates().to_dict(orient="records")
-    return {"success": True, "employees": employees}
 
 static_dir = os.path.join(BASE_DIR, "static")
 if not os.path.exists(static_dir):
