@@ -31,9 +31,7 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TABLE = "attendance_logs"
-COLUMNS = ["emp_id", "emp_name", "dept_name", "work_date", "check_in_time",
-           "check_out_time", "anomaly_type", "status", "notified_at"]
+TABLE = "attendance"
 
 _supabase: Optional[Client] = None
 
@@ -63,20 +61,81 @@ class CheckOutRequest(BaseModel):
     work_date: Optional[str] = None
     check_out_time: Optional[str] = None
 
-def read_logs_df() -> pd.DataFrame:
+def insert_attendance_tag(emp_id: str, emp_name: str, dept_name: str, tag_date: str, tag_time: str, event_type: str):
     sb = get_supabase()
-    rows, page, size = [], 0, 1000
-    while True:
-        res = sb.table(TABLE).select(",".join(COLUMNS)).range(page * size, (page + 1) * size - 1).execute()
-        rows.extend(res.data)
-        if len(res.data) < size:
-            break
-        page += 1
-    df = pd.DataFrame(rows, columns=COLUMNS)
-    return df.fillna("").astype(str)
+    log_id = f"ATT-LOG-{tag_date.replace('-', '')}-{datetime.now().strftime('%H%M%S%f')[:8]}"
+    new_tag = {
+        "log_id": log_id,
+        "emp_id": emp_id,
+        "emp_name": emp_name,
+        "dept_name": dept_name,
+        "tag_date": tag_date,
+        "tag_time": tag_time,
+        "event_type": event_type,
+        "gate_name": "웹ERP 단말기",
+        "device_id": "WEB-ERP-01",
+        "auth_method": "웹인증",
+        "raw_status": "SUCCESS",
+        "ip_address": "127.0.0.1"
+    }
+    sb.table(TABLE).insert(new_tag).execute()
 
-def upsert_log(row: dict):
-    get_supabase().table(TABLE).upsert(row, on_conflict="emp_id,work_date").execute()
+def read_logs_df() -> pd.DataFrame:
+    try:
+        sb = get_supabase()
+        res = sb.table(TABLE).select("*").execute()
+        raw_rows = res.data
+        if not raw_rows:
+            return pd.DataFrame(columns=["emp_id", "emp_name", "dept_name", "work_date", "check_in_time", "check_out_time", "anomaly_type", "status", "notified_at"])
+
+        grouped = {}
+        for r in raw_rows:
+            emp_id = str(r.get("emp_id", ""))
+            work_date = str(r.get("tag_date", ""))
+            key = (emp_id, work_date)
+            if key not in grouped:
+                grouped[key] = {
+                    "emp_id": emp_id,
+                    "emp_name": str(r.get("emp_name", "")),
+                    "dept_name": str(r.get("dept_name", "")),
+                    "work_date": work_date,
+                    "check_in_time": "",
+                    "check_out_time": "",
+                    "anomaly_type": "정상근무",
+                    "status": "조치완료",
+                    "notified_at": ""
+                }
+
+            event_type = str(r.get("event_type", "")).upper()
+            tag_time = str(r.get("tag_time", ""))
+            if event_type == "CHECK_IN":
+                if not grouped[key]["check_in_time"] or tag_time < grouped[key]["check_in_time"]:
+                    grouped[key]["check_in_time"] = tag_time
+            elif event_type == "CHECK_OUT":
+                if not grouped[key]["check_out_time"] or tag_time > grouped[key]["check_out_time"]:
+                    grouped[key]["check_out_time"] = tag_time
+
+        records = []
+        for g in grouped.values():
+            in_t = g["check_in_time"]
+            out_t = g["check_out_time"]
+            if in_t and in_t > "09:00:00":
+                g["anomaly_type"] = "지각"
+            elif out_t and out_t < "18:00:00":
+                g["anomaly_type"] = "조퇴"
+            elif in_t and not out_t:
+                g["anomaly_type"] = "미퇴근"
+            elif not in_t and out_t:
+                g["anomaly_type"] = "미출근"
+            else:
+                g["anomaly_type"] = "정상근무"
+            records.append(g)
+
+        df = pd.DataFrame(records)
+        return df.fillna("").astype(str)
+    except Exception as e:
+        print(f"[Supabase Read Error/Warning] {e}")
+        return pd.DataFrame(columns=["emp_id", "emp_name", "dept_name", "work_date", "check_in_time", "check_out_time", "anomaly_type", "status", "notified_at"])
 
 def get_filtered_logs(
     start_date: Optional[str] = None,
@@ -153,41 +212,19 @@ def process_check_in(req: CheckInRequest):
     now_time = req.check_in_time or datetime.now().strftime("%H:%M:%S")
 
     emp_id = req.emp_id.strip()
-    mask = (df["emp_id"] == emp_id) & (df["work_date"] == today)
-
-    if mask.any():
-        idx = df[mask].index[0]
-        df.at[idx, "check_in_time"] = now_time
-        if df.at[idx, "status"] == "미조치" or not df.at[idx, "status"]:
-            df.at[idx, "status"] = "조치완료"
-        upsert_log(df.loc[idx, COLUMNS].to_dict())
-        emp_name = str(df.at[idx, "emp_name"])
-        dept_name = str(df.at[idx, "dept_name"])
+    emp_match = df[df["emp_id"] == emp_id]
+    if not emp_match.empty:
+        emp_name = str(emp_match.iloc[0]["emp_name"])
+        dept_name = str(emp_match.iloc[0]["dept_name"])
     else:
-        emp_match = df[df["emp_id"] == emp_id]
-        if not emp_match.empty:
-            emp_name = str(emp_match.iloc[0]["emp_name"])
-            dept_name = str(emp_match.iloc[0]["dept_name"])
-        else:
-            emp_name = "안송이"
-            dept_name = "AI산업팀"
+        emp_name = "안송이"
+        dept_name = "AI산업팀"
 
-        new_row = {
-            "emp_id": emp_id,
-            "emp_name": emp_name,
-            "dept_name": dept_name,
-            "work_date": today,
-            "check_in_time": now_time,
-            "check_out_time": "",
-            "anomaly_type": "정상출근",
-            "status": "조치완료",
-            "notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        upsert_log(new_row)
+    insert_attendance_tag(emp_id, emp_name, dept_name, today, now_time, "CHECK_IN")
 
     return {
         "success": True,
-        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 출근 처리가 완료되었습니다. (Supabase 저장 완료)",
+        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 출근 처리가 완료되었습니다. (Supabase attendance 저장 완료)",
         "emp_id": emp_id,
         "emp_name": emp_name,
         "dept_name": dept_name,
@@ -202,40 +239,19 @@ def process_check_out(req: CheckOutRequest):
     now_time = req.check_out_time or datetime.now().strftime("%H:%M:%S")
 
     emp_id = req.emp_id.strip()
-    mask = (df["emp_id"] == emp_id) & (df["work_date"] == today)
-
-    if mask.any():
-        idx = df[mask].index[0]
-        df.at[idx, "check_out_time"] = now_time
-        df.at[idx, "status"] = "조치완료"
-        upsert_log(df.loc[idx, COLUMNS].to_dict())
-        emp_name = str(df.at[idx, "emp_name"])
-        dept_name = str(df.at[idx, "dept_name"])
+    emp_match = df[df["emp_id"] == emp_id]
+    if not emp_match.empty:
+        emp_name = str(emp_match.iloc[0]["emp_name"])
+        dept_name = str(emp_match.iloc[0]["dept_name"])
     else:
-        emp_match = df[df["emp_id"] == emp_id]
-        if not emp_match.empty:
-            emp_name = str(emp_match.iloc[0]["emp_name"])
-            dept_name = str(emp_match.iloc[0]["dept_name"])
-        else:
-            emp_name = "안송이"
-            dept_name = "AI산업팀"
+        emp_name = "안송이"
+        dept_name = "AI산업팀"
 
-        new_row = {
-            "emp_id": emp_id,
-            "emp_name": emp_name,
-            "dept_name": dept_name,
-            "work_date": today,
-            "check_in_time": "",
-            "check_out_time": now_time,
-            "anomaly_type": "정상퇴근",
-            "status": "조치완료",
-            "notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        upsert_log(new_row)
+    insert_attendance_tag(emp_id, emp_name, dept_name, today, now_time, "CHECK_OUT")
 
     return {
         "success": True,
-        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 퇴근 처리가 완료되었습니다. (Supabase 저장 완료)",
+        "message": f"[{emp_id}] {emp_name}({dept_name}) {today} {now_time} 퇴근 처리가 완료되었습니다. (Supabase attendance 저장 완료)",
         "emp_id": emp_id,
         "emp_name": emp_name,
         "dept_name": dept_name,
